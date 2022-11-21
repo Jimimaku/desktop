@@ -3,9 +3,10 @@ import {
   isRepositoryWithGitHubRepository,
   RepositoryWithGitHubRepository,
   isRepositoryWithForkedGitHubRepository,
+  getForkContributionTarget,
 } from '../../models/repository'
 import { ForkContributionTarget } from '../../models/workflow-preferences'
-import { PullRequest } from '../../models/pull-request'
+import { getPullRequestCommitRef, PullRequest } from '../../models/pull-request'
 import { API, APICheckConclusion } from '../api'
 import {
   createCombinedCheckFromChecks,
@@ -68,11 +69,13 @@ export function getNotificationsEnabled() {
  */
 export class NotificationsStore {
   private repository: RepositoryWithGitHubRepository | null = null
+  private recentRepositories: ReadonlyArray<Repository> = []
   private onChecksFailedCallback: OnChecksFailedCallback | null = null
   private onPullRequestReviewSubmitCallback: OnPullRequestReviewSubmitCallback | null =
     null
   private cachedCommits: Map<string, Commit> = new Map()
   private skipCommitShas: Set<string> = new Set()
+  private skipCheckRuns: Set<number> = new Set()
 
   public constructor(
     private readonly accountsStore: AccountsStore,
@@ -124,6 +127,11 @@ export class NotificationsStore {
     }
 
     if (!this.isValidRepositoryForEvent(repository, event)) {
+      if (this.isRecentRepositoryEvent(event)) {
+        this.statsStore.recordPullRequestReviewNotiificationFromRecentRepo()
+      } else {
+        this.statsStore.recordPullRequestReviewNotiificationFromNonRecentRepo()
+      }
       return
     }
 
@@ -140,16 +148,17 @@ export class NotificationsStore {
       return
     }
 
-    const { gitHubRepository } = repository
-    const api = await this.getAPIForRepository(gitHubRepository)
+    // PR reviews must be retrieved from the repository the PR belongs to
+    const pullsRepository = this.getContributingRepository(repository)
+    const api = await this.getAPIForRepository(pullsRepository)
 
     if (api === null) {
       return
     }
 
     const review = await api.fetchPullRequestReview(
-      gitHubRepository.owner.login,
-      gitHubRepository.name,
+      pullsRepository.owner.login,
+      pullsRepository.name,
       pullRequest.pullRequestNumber.toString(),
       event.review_id
     )
@@ -199,6 +208,11 @@ export class NotificationsStore {
     }
 
     if (!this.isValidRepositoryForEvent(repository, event)) {
+      if (this.isRecentRepositoryEvent(event)) {
+        this.statsStore.recordChecksFailedNotificationFromRecentRepo()
+      } else {
+        this.statsStore.recordChecksFailedNotificationFromNonRecentRepo()
+      }
       return
     }
 
@@ -244,8 +258,26 @@ export class NotificationsStore {
       return
     }
 
-    const checks = await this.getChecksForRef(repository, pullRequest.head.ref)
+    // Checks must be retrieved from the repository the PR belongs to
+    const checksRepository = this.getContributingRepository(repository)
+
+    const checks = await this.getChecksForRef(
+      checksRepository,
+      getPullRequestCommitRef(pullRequest.pullRequestNumber)
+    )
     if (checks === null) {
+      return
+    }
+
+    // Make sure we haven't shown a notification for the check runs of this
+    // check suite already.
+    // If one of more jobs are re-run, the check suite will have the same ID
+    // but different check runs.
+    const checkSuiteCheckRunIds = checks.flatMap(check =>
+      check.checkSuiteId === event.check_suite_id ? check.id : []
+    )
+
+    if (checkSuiteCheckRunIds.every(id => this.skipCheckRuns.has(id))) {
       return
     }
 
@@ -258,6 +290,12 @@ export class NotificationsStore {
     // scenario, just ignore the event and don't show a notification.
     if (numberOfFailedChecks === 0) {
       return
+    }
+
+    // Ignore any remaining notification for check runs that started along
+    // with this one.
+    for (const check of checks) {
+      this.skipCheckRuns.add(check.id)
     }
 
     const pluralChecks =
@@ -293,6 +331,18 @@ export class NotificationsStore {
     this.statsStore.recordChecksFailedNotificationShown()
   }
 
+  private getContributingRepository(
+    repository: RepositoryWithGitHubRepository
+  ) {
+    const isForkContributingToParent =
+      isRepositoryWithForkedGitHubRepository(repository) &&
+      getForkContributionTarget(repository) === ForkContributionTarget.Parent
+
+    return isForkContributingToParent
+      ? repository.gitHubRepository.parent
+      : repository.gitHubRepository
+  }
+
   private isValidRepositoryForEvent(
     repository: RepositoryWithGitHubRepository,
     event: DesktopAliveEvent
@@ -301,8 +351,7 @@ export class NotificationsStore {
     // match the parent repository.
     if (
       isRepositoryWithForkedGitHubRepository(repository) &&
-      repository.workflowPreferences.forkContributionTarget ===
-        ForkContributionTarget.Parent
+      getForkContributionTarget(repository) === ForkContributionTarget.Parent
     ) {
       const parentRepository = repository.gitHubRepository.parent
       return (
@@ -318,14 +367,42 @@ export class NotificationsStore {
     )
   }
 
+  private isRecentRepositoryEvent(event: DesktopAliveEvent) {
+    return this.recentRepositories.some(
+      r =>
+        isRepositoryWithGitHubRepository(r) &&
+        this.isValidRepositoryForEvent(r, event)
+    )
+  }
+
   /**
    * Makes the store to keep track of the currently selected repository. Only
    * notifications for the currently selected repository will be shown.
    */
   public selectRepository(repository: Repository) {
+    if (repository.hash === this.repository?.hash) {
+      return
+    }
+
     this.repository = isRepositoryWithGitHubRepository(repository)
       ? repository
       : null
+    this.resetCache()
+  }
+
+  private resetCache() {
+    this.cachedCommits.clear()
+    this.skipCommitShas.clear()
+    this.skipCheckRuns.clear()
+  }
+
+  /**
+   * For stats purposes, we need to know which are the recent repositories. This
+   * will allow the notification store when a notification is related to one of
+   * these repositories.
+   */
+  public setRecentRepositories(repositories: ReadonlyArray<Repository>) {
+    this.recentRepositories = repositories
   }
 
   private async getAccountForRepository(repository: GitHubRepository) {
@@ -345,22 +422,20 @@ export class NotificationsStore {
     return API.fromAccount(account)
   }
 
-  private async getChecksForRef(
-    repository: RepositoryWithGitHubRepository,
-    ref: string
-  ) {
-    const { gitHubRepository } = repository
-    const { owner, name } = gitHubRepository
+  private async getChecksForRef(repository: GitHubRepository, ref: string) {
+    const { owner, name } = repository
 
-    const api = await this.getAPIForRepository(gitHubRepository)
+    const api = await this.getAPIForRepository(repository)
 
     if (api === null) {
       return null
     }
 
+    // Hit these API endpoints reloading the cache to make sure we have the
+    // latest data at the time the notification is received.
     const [statuses, checkRuns] = await Promise.all([
-      api.fetchCombinedRefStatus(owner.login, name, ref),
-      api.fetchRefCheckRuns(owner.login, name, ref),
+      api.fetchCombinedRefStatus(owner.login, name, ref, true),
+      api.fetchRefCheckRuns(owner.login, name, ref, true),
     ])
 
     const checks = new Array<IRefCheck>()
